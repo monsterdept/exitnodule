@@ -77,7 +77,21 @@ pub fn start(cfg: &Config, name: &str, node: &Node) -> Result<()> {
         Backend::Docker => docker::start(&node.vm),
         Backend::Tart => tart::start(&node.vm, &cfg.log_file(name)),
         Backend::Incus => incus::start(&node.vm),
-    }
+    }?;
+    ensure_lan_route(node)
+}
+
+/// Keep the node's own local network off the exit node, so this machine can
+/// always reach its proxy. Tailscale's --exit-node-allow-lan-access is meant
+/// to do this, but its exemption can drop out of the routing table while the
+/// node keeps running (seen on Linux), after which replies to this machine go
+/// to the exit node and the proxy goes dark. A rule ahead of Tailscale's
+/// (5270) sends the local subnet via the main table regardless. POSIX sh, so
+/// it runs in the Alpine-based Tailscale image too.
+pub const LAN_ROUTE: &str = r#"net=$(ip -4 route show proto kernel scope link | awk '$3 !~ /^tailscale/ {print $1; exit}'); [ -n "$net" ] && { ip rule show | grep -q "to $net lookup main" || ip rule add to "$net" lookup main priority 5200; }"#;
+
+pub fn ensure_lan_route(node: &Node) -> Result<()> {
+    exec_ok(node, LAN_ROUTE).map(|_| ())
 }
 
 pub fn stop(node: &Node) -> Result<()> {

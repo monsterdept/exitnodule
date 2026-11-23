@@ -80,6 +80,9 @@ enum Cmd {
     },
     /// Delete the node and remove it from the tailnet.
     Destroy { name: String },
+    /// Nodes, their backend, state, exit node and proxy (no probing; fast).
+    #[command(alias = "ls")]
+    List,
     /// State, exit node, public address and proxy of every node.
     Status {
         #[arg(long)]
@@ -150,6 +153,7 @@ fn run(cli: Cli) -> Result<()> {
             args,
         } => run_workload(&cfg, &name, image, dockerfile, &docker_args, &args),
         Cmd::Destroy { name } => destroy(&cfg, &name),
+        Cmd::List => list(&cfg),
         Cmd::Status { json } => status(&cfg, json),
         Cmd::Proxies => {
             let urls: Vec<String> = cfg
@@ -232,8 +236,23 @@ DynamicUser=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+cat > /etc/systemd/system/exitnodule-lan.service <<'EOF'
+[Unit]
+Description=exitnodule: keep the local network off the exit node
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '__LAN_ROUTE__'
+
+[Install]
+WantedBy=multi-user.target
+EOF
 systemctl daemon-reload
 systemctl enable --now exitnodule-socks
+systemctl enable exitnodule-lan
 "#;
 
 fn sh_quote(s: &str) -> String {
@@ -251,7 +270,8 @@ fn egress(node: &Node) -> Value {
     };
     let agent = ureq::AgentBuilder::new()
         .proxy(proxy)
-        .timeout(Duration::from_secs(15))
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(8))
         .build();
     for url in ["https://am.i.mullvad.net/json", "https://ipinfo.io/json"] {
         if let Ok(v) = agent
@@ -268,7 +288,8 @@ fn egress(node: &Node) -> Value {
 
 fn describe_egress(e: &Value) -> String {
     if e.is_null() {
-        return "unreachable through its proxy".into();
+        return "unknown: proxy unreachable from this machine (try `exitnodule start <name>`)"
+            .into();
     }
     let ip = e["ip"].as_str().unwrap_or("?");
     let place: Vec<&str> = [e["city"].as_str(), e["country"].as_str()]
@@ -355,7 +376,9 @@ fn init(
             say("Installing Tailscale and the SOCKS proxy");
             backend::exec_ok(
                 &node,
-                &PROVISION.replace("__PORT__", &SOCKS_PORT.to_string()),
+                &PROVISION
+                    .replace("__PORT__", &SOCKS_PORT.to_string())
+                    .replace("__LAN_ROUTE__", &backend::LAN_ROUTE.replace('\'', r"'\''")),
             )?;
             say(&format!("Joining the tailnet as {vm} ({})", cfg.tag));
             let up = format!(
@@ -402,7 +425,7 @@ fn point_at_exit(cfg: &Config, name: &str, node: &Node, exit_node: &str) -> Resu
     for _ in 0..30 {
         let out = backend::exec(node, &cmd)?;
         if out.status.success() {
-            return Ok(());
+            return backend::ensure_lan_route(node);
         }
         last = String::from_utf8_lossy(&out.stderr).trim().to_string();
         std::thread::sleep(Duration::from_secs(2));
@@ -497,6 +520,32 @@ fn destroy(cfg: &Config, name: &str) -> Result<()> {
     );
     nodes.remove(name);
     cfg.save_nodes(&nodes)
+}
+
+fn list(cfg: &Config) -> Result<()> {
+    let nodes = cfg.load_nodes()?;
+    if nodes.is_empty() {
+        println!("No nodes. Create one with `exitnodule init --name node1 --exit-node <host>`.");
+        return Ok(());
+    }
+    println!(
+        "{:<10} {:<7} {:<9} {:<34} PROXY",
+        "NAME", "BACKEND", "STATE", "EXIT NODE"
+    );
+    for (name, node) in &nodes {
+        let state = backend::state(node);
+        let proxy = if state == "running" {
+            backend::proxy_url(node).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        println!(
+            "{name:<10} {:<7} {state:<9} {:<34} {proxy}",
+            node.backend.name(),
+            node.exit_node
+        );
+    }
+    Ok(())
 }
 
 fn status(cfg: &Config, as_json: bool) -> Result<()> {
