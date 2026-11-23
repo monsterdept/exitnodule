@@ -7,7 +7,8 @@ whose traffic leaves via a node.
 
 ```
 exitnodule init --name node1 --exit-node us-sfo-wg-001.mullvad.ts.net
-exitnodule status                  # state, exit node, public address, proxy URL
+exitnodule list                    # nodes, backend, state, exit node, proxy (fast, no probing)
+exitnodule status                  # state, exit node, public address, proxy URL (--json)
 exitnodule proxies                 # socks5h://127.0.0.1:10800,... for running nodes
 exitnodule shell node1             # shell inside; its traffic leaves via the exit node
 exitnodule run node1 --image curlimages/curl -- -s https://am.i.mullvad.net/json
@@ -69,12 +70,17 @@ network namespace (`--network container:…`), so the workload needs no proxy at
 
    Merge these into what's there; `exitnodule doctor` should then be all `[ok]`.
 
-4. **Install:** `cargo install --path .` (or `just install`).
+4. **Install:** `brew install monsterdept/tap/exitnodule` (macOS and Linux), an
+   archive from [Releases](https://github.com/monsterdept/exitnodule/releases), or
+   from source: `cargo install --path .` (or `just install`).
 
 `init` creates a single-use, pre-approved auth key tagged `tag:exitnodule` through the
 Tailscale API, joins the node, then sets the exit node with
 `--exit-node-allow-lan-access` (so this machine can still reach the proxy).
-`destroy` deletes the device through the API.
+Because that exemption can drop out of a Linux node's routing table while it
+runs, each node also gets its own routing rule that keeps its local subnet off
+the exit node, reapplied on every start and exit-node change. `destroy` deletes
+the device through the API.
 
 ### A note on Mullvad accounting
 
@@ -88,8 +94,10 @@ add-on's free device slots.
 
 In the env file: `TS_TAG` (default `tag:exitnodule`), `EXITNODULE_BACKEND`
 (`docker`), `EXITNODULE_BASE` (image for tart/incus), `EXITNODULE_MEMORY_MB` (1024)
-and `EXITNODULE_CPUS` (1) for Tart VMs. State lives next to it in `nodes.json`;
-Tart VM consoles log to `logs/`.
+and `EXITNODULE_CPUS` (1) for Tart VMs. Any `TS_*` or `EXITNODULE_*` variable in
+the process environment overrides the file. State lives next to it in
+`nodes.json`; Tart VM consoles log to `logs/`. `EXITNODULE_HOME` moves the whole
+directory.
 
 ## Building
 
@@ -99,3 +107,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu    # cross-compile (n
 ```
 
 CI builds and lints on macOS, Linux and Windows.
+
+## License
+
+exitnodule is free software under the [GNU General Public License, version 3 or later](LICENSE).

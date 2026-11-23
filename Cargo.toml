@@ -3,7 +3,7 @@ name = "exitnodule"
 version = "0.1.0"
 edition = "2021"
 description = "Small Linux VMs (Tart) that each leave via a different Tailscale exit node, with a SOCKS proxy for this Mac"
-license = "MIT"
+license = "GPL-3.0-or-later"
 publish = false
 
 [dependencies]

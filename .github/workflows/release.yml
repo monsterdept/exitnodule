@@ -1,0 +1,307 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Every job writes to the release: `draft` creates it, each build pushes its archive into it,
+# `release` adds SHA256SUMS and publishes it.
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The draft is made once, here, before any build can race to make one. Builds that each
+  # let `gh release upload` find-or-create the release can land in the same second and make
+  # two drafts — see sanity's release.yml for how that went.
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The tag is the version, and the binary reports Cargo.toml's. A tag that disagrees
+      # with Cargo.toml stops here, before the draft exists and before anything builds.
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          got=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "exitnodule") | .version')
+          [ "$got" = "$want" ] || { echo "::error::tag is $GITHUB_REF_NAME but Cargo.toml says $got"; exit 1; }
+          [ -f LICENSE ] || { echo "::error::no LICENSE file; the archives ship one"; exit 1; }
+
+      - name: Ensure the draft release exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A `-suffix` tag is a prerelease, and GitHub has to be told, or it becomes "latest".
+          PRERELEASE: ${{ contains(github.ref_name, '-') }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "draft already exists for $GITHUB_REF_NAME"
+          else
+            v="${GITHUB_REF_NAME#v}"
+            dl="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+            notes=$(cat <<NOTES
+          ## Install
+
+          \`brew install monsterdept/tap/exitnodule\` on macOS and Linux, or download one:
+
+          | Platform | Download |
+          |---|---|
+          | macOS (Apple silicon) | [exitnodule-${v}-aarch64-apple-darwin.tar.gz](${dl}/exitnodule-${v}-aarch64-apple-darwin.tar.gz) |
+          | macOS (Intel) | [exitnodule-${v}-x86_64-apple-darwin.tar.gz](${dl}/exitnodule-${v}-x86_64-apple-darwin.tar.gz) |
+          | Linux x64 | [exitnodule-${v}-x86_64-unknown-linux-gnu.tar.gz](${dl}/exitnodule-${v}-x86_64-unknown-linux-gnu.tar.gz) |
+          | Linux ARM | [exitnodule-${v}-aarch64-unknown-linux-gnu.tar.gz](${dl}/exitnodule-${v}-aarch64-unknown-linux-gnu.tar.gz) |
+          | Windows x64 | [exitnodule-${v}-x86_64-pc-windows-msvc.zip](${dl}/exitnodule-${v}-x86_64-pc-windows-msvc.zip) |
+
+          NOTES
+          )
+            # The heredoc sits at the script's indentation, which YAML strips, so the markdown
+            # reaches gh flush left and NOTES closes at column 0.
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --prerelease="$PRERELEASE" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "$notes" \
+              --generate-notes
+          fi
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GitHub-hosted, each target built natively on its own architecture: no cross
+          # toolchain. 22.04 because a Linux binary runs on distros whose glibc is at least
+          # the one it was built against.
+          - os: macos-15
+            triple: aarch64-apple-darwin
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            triple: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          exe=exitnodule; [ "$RUNNER_OS" = "Windows" ] && exe=exitnodule.exe
+          echo "bin=target/release/$exe" >> "$GITHUB_OUTPUT"
+          echo "exe=$exe" >> "$GITHUB_OUTPUT"
+
+      # The binary is asked, not the filename: the filename is chosen by this same job.
+      - name: Check the binary
+        shell: bash
+        env:
+          BIN: ${{ steps.build.outputs.bin }}
+        run: |
+          set -euo pipefail
+          got="$("$BIN" --version)"
+          want="exitnodule ${GITHUB_REF_NAME#v}"
+          [ "$got" = "$want" ] || { echo "::error::binary reports '$got', expected '$want'"; exit 1; }
+          "$BIN" --help >/dev/null
+
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          BIN: ${{ steps.build.outputs.bin }}
+          EXE: ${{ steps.build.outputs.exe }}
+        run: |
+          set -euo pipefail
+          name="exitnodule-${GITHUB_REF_NAME#v}-${{ matrix.triple }}"
+          rm -rf dist && mkdir -p "dist/$name"
+          cp "$BIN" LICENSE README.md "dist/$name/"
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -NoProfile -Command "Compress-Archive -Path '$name/*' -DestinationPath '$name.zip'"
+            file="$name.zip"
+          else
+            # Flat, no top directory: the formula's `bin.install "exitnodule"` expects the
+            # binary at the root of what brew unpacks.
+            tar -czf "$name.tar.gz" -C "$name" "$EXE" LICENSE README.md
+            file="$name.tar.gz"
+          fi
+          ls -l "$file"
+          echo "file=dist/$file" >> "$GITHUB_OUTPUT"
+
+      # Retried: the release service fails transiently on its own side.
+      - name: Push the archive to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FILE: ${{ steps.package.outputs.file }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$GITHUB_REF_NAME" "$FILE" --clobber; then
+              echo "uploaded on attempt $attempt"
+              exit 0
+            fi
+            echo "upload attempt $attempt failed; retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "::error::release asset upload failed after 5 attempts"
+          exit 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout, so gh has no local .git to infer the repo from.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # SHA256SUMS, taken from the files as the release serves them and checked against
+          # the digest GitHub computed on upload, so a file damaged between runner and
+          # release cannot be vouched for here.
+          rm -rf sums && mkdir sums
+          gh release download "$GITHUB_REF_NAME" --dir sums
+          rm -f sums/SHA256SUMS
+          (cd sums && sha256sum -- * | sort -k2) > SHA256SUMS
+          gh release view "$GITHUB_REF_NAME" --json assets \
+            --jq '.assets[] | select(.name != "SHA256SUMS") | "\(.digest // "none" | sub("^sha256:"; ""))  \(.name)"' \
+            | sort -k2 > github.sums
+          if ! diff SHA256SUMS github.sums; then
+            echo "::error::a release file does not match the digest GitHub recorded for it"
+            exit 1
+          fi
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS --clobber
+          cat SHA256SUMS
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+
+  # **The Homebrew formula, generated from the archives this release just published.**
+  #
+  # TAP_DEPLOY_KEY is the private half of a deploy key on monsterdept/homebrew-tap with write
+  # access to that one repo. The formula points at GitHub Releases, which serve nothing while
+  # this repo is private, so the job waits for public. Prereleases don't move the tap.
+  formula:
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') && !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update the formula
+        shell: bash
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          TAP_REPO: monsterdept/homebrew-tap
+        run: |
+          set -euo pipefail
+          [ -n "$TAP_DEPLOY_KEY" ] || { echo "::error::TAP_DEPLOY_KEY is not set — see the comment on this job"; exit 1; }
+          # The key, and github.com's host keys as GitHub publishes them over HTTPS, so the
+          # first connection is not a trust-on-first-use guess.
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$TAP_DEPLOY_KEY" > ~/.ssh/tap && chmod 600 ~/.ssh/tap
+          curl -fsSL https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com " + .' > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap -o IdentitiesOnly=yes"
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+
+          # Each sha256 has to describe the bytes brew will fetch, so it is taken from what
+          # the URL serves. A wrong checksum fails on every user's machine and nowhere else.
+          declare -A SHA
+          for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            url="${BASE}/exitnodule-${VERSION}-${t}.tar.gz"
+            code=$(curl -sL -o archive -w '%{http_code}' "$url")
+            [ "$code" = "200" ] || { echo "::error::$url returned HTTP $code"; exit 1; }
+            SHA[$t]=$(sha256sum archive | awk '{print $1}')
+          done
+
+          url() { echo "      url \"https://github.com/${GITHUB_REPOSITORY}/releases/download/v#{version}/exitnodule-#{version}-$1.tar.gz\""; }
+          git clone --depth 1 "git@github.com:${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          {
+          echo '# typed: false'
+          echo '# frozen_string_literal: true'
+          echo ''
+          echo "# Generated by exitnodule's release workflow. DO NOT EDIT."
+          echo 'class Exitnodule < Formula'
+          echo '  desc "Nodes that each leave via a different Tailscale exit node"'
+          echo "  homepage \"https://github.com/${GITHUB_REPOSITORY}\""
+          echo "  version \"${VERSION}\""
+          echo '  license "GPL-3.0-or-later"'
+          echo ''
+          echo '  on_macos do'
+          echo '    on_arm do'
+          url aarch64-apple-darwin
+          echo "      sha256 \"${SHA[aarch64-apple-darwin]}\""
+          echo '    end'
+          echo '    on_intel do'
+          url x86_64-apple-darwin
+          echo "      sha256 \"${SHA[x86_64-apple-darwin]}\""
+          echo '    end'
+          echo '  end'
+          echo ''
+          echo '  on_linux do'
+          echo '    on_arm do'
+          url aarch64-unknown-linux-gnu
+          echo "      sha256 \"${SHA[aarch64-unknown-linux-gnu]}\""
+          echo '    end'
+          echo '    on_intel do'
+          url x86_64-unknown-linux-gnu
+          echo "      sha256 \"${SHA[x86_64-unknown-linux-gnu]}\""
+          echo '    end'
+          echo '  end'
+          echo ''
+          echo '  def install'
+          echo '    bin.install "exitnodule"'
+          echo '  end'
+          echo ''
+          echo '  test do'
+          echo '    assert_match version.to_s, shell_output("#{bin}/exitnodule --version")'
+          echo '  end'
+          echo 'end'
+          } > tap/Formula/exitnodule.rb
+          ruby -c tap/Formula/exitnodule.rb >/dev/null
+
+          cd tap
+          git add Formula/exitnodule.rb
+          # **A regenerated formula may only ADD.** A re-run of an old tag, or an older
+          # generator, must not silently drop lines a newer one wrote. version, sha256 and url
+          # are the lines that are supposed to change.
+          lost=$(git diff --staged -U0 -- Formula/exitnodule.rb \
+              | grep '^-' | grep -v '^---' \
+              | grep -vE '^-[[:space:]]+(version|sha256|url) ' \
+              | grep -v "^-# Generated by" || true)
+          if [ -n "$lost" ]; then
+            echo "::error::regenerating the formula would REMOVE lines:"
+            echo "$lost"
+            exit 1
+          fi
+          if git diff --staged --quiet; then
+            echo "formula already current"
+            exit 0
+          fi
+          git -c user.name="exitnodule release" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "exitnodule ${VERSION}"
+          git push -q
+          # Read back at the exact commit pushed: raw.githubusercontent.com/<repo>/main is a
+          # CDN that can lag the branch; a commit SHA is never stale.
+          pushed=$(git rev-parse HEAD)
+          remote=$(git ls-remote origin "refs/heads/$(git rev-parse --abbrev-ref HEAD)" | awk '{print $1}')
+          [ "$remote" = "$pushed" ] || { echo "::error::tap is at ${remote:-none}, expected $pushed"; exit 1; }
+          served=$(curl -sL "https://raw.githubusercontent.com/${TAP_REPO}/${pushed}/Formula/exitnodule.rb" | awk -F'"' '/^  version/{print $2}')
+          [ "$served" = "$VERSION" ] || { echo "::error::tap serves '${served:-none}', expected $VERSION"; exit 1; }
+          echo "tap serves $served"
