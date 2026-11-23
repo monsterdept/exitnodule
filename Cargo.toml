@@ -1,0 +1,18 @@
+[package]
+name = "exitnodule"
+version = "0.1.0"
+edition = "2021"
+description = "Small Linux VMs (Tart) that each leave via a different Tailscale exit node, with a SOCKS proxy for this Mac"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json", "socks-proxy"] }
+
+[profile.release]
+lto = "thin"
+strip = true
