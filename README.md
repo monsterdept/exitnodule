@@ -92,12 +92,19 @@ add-on's free device slots.
 
 ## Settings
 
-In the env file: `TS_TAG` (default `tag:exitnodule`), `EXITNODULE_BACKEND`
-(`docker`), `EXITNODULE_BASE` (image for tart/incus), `EXITNODULE_MEMORY_MB` (1024)
-and `EXITNODULE_CPUS` (1) for Tart VMs. Any `TS_*` or `EXITNODULE_*` variable in
-the process environment overrides the file. State lives next to it in
-`nodes.json`; Tart VM consoles log to `logs/`. `EXITNODULE_HOME` moves the whole
-directory.
+Set these in the env file, or in your shell, which wins over the file:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TS_TAG` | `tag:exitnodule` | Tag given to every node |
+| `EXITNODULE_BACKEND` | `docker` | Backend for `init` when `--backend` isn't given |
+| `EXITNODULE_BASE` | per backend | Image for Tart and Incus nodes |
+| `EXITNODULE_MEMORY_MB` | `1024` | Memory per Tart VM |
+| `EXITNODULE_CPUS` | `1` | CPUs per Tart VM |
+| `EXITNODULE_HOME` | `~/.config/exitnodule` | Where the env file and state live (shell only) |
+
+Alongside the env file: `nodes.json` (the nodes exitnodule manages) and `logs/`
+(Tart VM consoles).
 
 ## Building
 
